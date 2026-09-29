@@ -82,11 +82,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          git clone https://github.com/microsoft/vcpkg $env:USERPROFILE/vcpkg
-          $env:USERPROFILE/vcpkg/bootstrap-vcpkg.bat
-          $env:VCPKG_ROOT="$env:USERPROFILE/vcpkg"
-          $env:PATH="$env:VCPKG_ROOT;$env:PATH"
-
+          $VCPKG_ROOT = "$env:USERPROFILE\vcpkg"
+          git clone https://github.com/microsoft/vcpkg $VCPKG_ROOT
+          & "$VCPKG_ROOT\bootstrap-vcpkg.bat"
+      
           $pkgs = @(
             "proj",
             "geos",
@@ -98,10 +97,13 @@ jobs:
             "hdf5",
             "netcdf-c"
           )
-
+      
           foreach ($p in $pkgs) {
-            & $env:VCPKG_ROOT/vcpkg install $p --triplet x64-windows
+            & "$VCPKG_ROOT\vcpkg" install $p --triplet x64-windows
           }
+      
+          echo "VCPKG_ROOT=$VCPKG_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
+
 
       - name: Install SWIG (Windows)
         if: runner.os == 'Windows'
