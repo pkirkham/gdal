@@ -1,0 +1,243 @@
+name: GDAL Java Wrapper
+
+on:
+  push:
+    branches: [ 'master', 'main', 'develop' ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ 'master', 'main', 'develop' ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' && github.ref != 'refs/heads/develop' && !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            sysname: Linux
+          - os: windows-latest
+            sysname: Windows
+          - os: macos-latest
+            sysname: Darwin
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v5.4.0
+        with:
+          java-version: '25'
+          distribution: 'zulu'
+          java-package: 'jdk'
+
+      # ------------------------------------------------------------
+      # LINUX DEPENDENCIES
+      # ------------------------------------------------------------
+      - name: Install deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            swig \
+            build-essential cmake ninja-build \
+            libproj-dev proj-data proj-bin \
+            libgeos-dev \
+            libsqlite3-dev \
+            libcurl4-openssl-dev \
+            libtiff-dev libgeotiff-dev \
+            libpng-dev libjpeg-dev \
+            zlib1g-dev \
+            libnetcdf-dev \
+            libhdf5-dev
+
+      # ------------------------------------------------------------
+      # MACOS DEPENDENCIES
+      # ------------------------------------------------------------
+      - name: Install deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install \
+            swig cmake ninja \
+            proj geos sqlite curl \
+            libtiff libpng jpeg \
+            netcdf hdf5
+
+      # ------------------------------------------------------------
+      # WINDOWS DEPENDENCIES (via vcpkg)
+      # ------------------------------------------------------------
+      - name: Install vcpkg + deps (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg $env:USERPROFILE/vcpkg
+          $env:USERPROFILE/vcpkg/bootstrap-vcpkg.bat
+          $env:VCPKG_ROOT="$env:USERPROFILE/vcpkg"
+          $env:PATH="$env:VCPKG_ROOT;$env:PATH"
+
+          $pkgs = @(
+            "proj",
+            "geos",
+            "sqlite3",
+            "curl",
+            "tiff",
+            "libpng",
+            "jpeg",
+            "hdf5",
+            "netcdf-c"
+          )
+
+          foreach ($p in $pkgs) {
+            & $env:VCPKG_ROOT/vcpkg install $p --triplet x64-windows
+          }
+
+      - name: Install SWIG (Windows)
+        if: runner.os == 'Windows'
+        run: choco install swig -y --no-progress
+
+      - name: Set up MSVC developer environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # ------------------------------------------------------------
+      # CONFIGURE GDAL
+      # ------------------------------------------------------------
+      - name: Configure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GEN_ARGS=""
+          EXTRA_ARGS=""
+
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            GEN_ARGS="-G Ninja"
+            EXTRA_ARGS="-DCMAKE_TOOLCHAIN_FILE=$USERPROFILE/vcpkg/scripts/buildsystems/vcpkg.cmake"
+          fi
+
+          cmake -B build -S . $GEN_ARGS \
+            -DGDAL_USE_JAVA=ON \
+            -DGDAL_ENABLE_DRIVER_OPENFILEGDB=ON \
+            -DGDAL_ENABLE_DRIVER_GTiff=ON \
+            -DGDAL_ENABLE_DRIVER_GPKG=ON \
+            -DGDAL_ENABLE_DRIVER_CSV=ON \
+            -DGDAL_ENABLE_DRIVER_NetCDF=ON \
+            -DGDAL_ENABLE_DRIVER_HDF5=ON \
+            -DGDAL_ENABLE_DRIVER_SHAPE=ON \
+            -DGDAL_ENABLE_DRIVER_MEM=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/install_root" \
+            $EXTRA_ARGS
+
+      # ------------------------------------------------------------
+      # BUILD
+      # ------------------------------------------------------------
+      - name: Build and install
+        shell: bash
+        run: |
+          JOBS=$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 2)
+          cmake --build build --target install --config Release -j "$JOBS"
+
+      # ------------------------------------------------------------
+      # COLLECT JAVA ARTIFACTS
+      # ------------------------------------------------------------
+      - name: Collect Java artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="Java"
+          mkdir -p "$out"
+
+          javadir=""
+          if [ -d "install_root/swig/java" ]; then
+            javadir="install_root/swig/java"
+          elif [ -d "build/swig/java" ]; then
+            javadir="build/swig/java"
+          else
+            echo "FAIL: no swig/java directory found." >&2
+            exit 1
+          fi
+
+          cp "$javadir"/gdal.jar "$out"/gdal.jar
+
+          find "$javadir" \
+            \( -name 'gdalalljni.dll' -o -name 'libgdalalljni.so' -o -name 'libgdalalljni.dylib' \) \
+            -type f -exec cp {} "$out"/ \;
+
+      - name: Upload per-OS Java artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: GDAL-Java-${{ matrix.sysname }}
+          path: Java
+
+  # ------------------------------------------------------------
+  # MERGE JOB
+  # ------------------------------------------------------------
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+
+    steps:
+      - name: Download per-OS artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: GDAL-Java-*
+          path: staging
+
+      - name: Assemble unified Java tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p Java
+
+          # Copy gdal.jar (first valid one wins)
+          jar=""
+          for d in staging/GDAL-Java-*/; do
+            cand="${d}gdal.jar"
+            if [ -z "$jar" ] && [ -s "$cand" ]; then
+              cp "$cand" Java/gdal.jar
+              jar="Java/gdal.jar"
+            fi
+          done
+
+          if [ -z "$jar" ]; then
+            echo "FAIL: no gdal.jar found." >&2
+            exit 1
+          fi
+
+          # Copy per-OS native libs
+          for d in staging/GDAL-Java-*/; do
+            sysname=$(basename "$d" | sed 's/^GDAL-Java-//')
+            outdir="Java/${sysname}"
+            mkdir -p "$outdir"
+
+            find "$d" \
+              \( -name 'gdalalljni.dll' -o -name 'libgdalalljni.so' -o -name 'libgdalalljni.dylib' \) \
+              -type f -exec cp {} "$outdir"/ \;
+          done
+
+      - name: Upload unified GDAL Java artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: GDAL-Java
+          path: Java
+
+      - name: Delete intermediate per-OS artifacts
+        uses: geekyeggo/delete-artifact@v6
+        with:
+          name: GDAL-Java-*
