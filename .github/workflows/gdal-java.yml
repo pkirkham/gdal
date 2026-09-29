@@ -21,12 +21,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # 22.04 = older glibc, so the .so loads on more Linux distros
+          - os: ubuntu-22.04
             sysname: Linux
+            triplet: x64-linux
           - os: windows-latest
             sysname: Windows
+            triplet: x64-windows-static-md
           - os: macos-latest
             sysname: Darwin
+            triplet: arm64-osx
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -43,75 +47,74 @@ jobs:
           java-package: 'jdk'
 
       # ------------------------------------------------------------
-      # LINUX DEPENDENCIES
+      # BUILD TOOLS ONLY (libraries come from vcpkg)
       # ------------------------------------------------------------
-      - name: Install deps (Linux)
+      - name: Install tools (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y \
-            swig \
-            build-essential cmake ninja-build \
-            libproj-dev proj-data proj-bin \
-            libgeos-dev \
-            libsqlite3-dev \
-            libcurl4-openssl-dev \
-            libtiff-dev libgeotiff-dev \
-            libpng-dev libjpeg-dev \
-            zlib1g-dev \
-            libnetcdf-dev \
-            libhdf5-dev
+          sudo apt-get install -y swig ant ninja-build pkg-config \
+            autoconf automake libtool curl zip unzip tar
 
-      # ------------------------------------------------------------
-      # MACOS DEPENDENCIES
-      # ------------------------------------------------------------
-      - name: Install deps (macOS)
+      - name: Install tools (macOS)
         if: runner.os == 'macOS'
-        run: |
-          brew update
-          brew install \
-            swig cmake ninja \
-            proj geos sqlite curl \
-            libtiff libpng jpeg \
-            netcdf hdf5
+        run: brew install swig ant ninja pkg-config autoconf automake libtool
 
-      # ------------------------------------------------------------
-      # WINDOWS DEPENDENCIES (via vcpkg)
-      # ------------------------------------------------------------
-      - name: Install vcpkg + deps (Windows)
+      - name: Install tools (Windows)
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $VCPKG_ROOT = "$env:USERPROFILE\vcpkg"
-          git clone https://github.com/microsoft/vcpkg $VCPKG_ROOT
-          & "$VCPKG_ROOT\bootstrap-vcpkg.bat"
-      
-          $pkgs = @(
-            "proj",
-            "geos",
-            "sqlite3",
-            "curl",
-            "tiff",
-            "libpng",
-            "jpeg",
-            "hdf5",
-            "netcdf-c"
-          )
-      
-          foreach ($p in $pkgs) {
-            & "$VCPKG_ROOT\vcpkg" install $p --triplet x64-windows
-          }
-      
-          echo "VCPKG_ROOT=$VCPKG_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-
-      - name: Install SWIG (Windows)
-        if: runner.os == 'Windows'
-        run: choco install swig -y --no-progress
+        run: choco install swig ant ninja -y --no-progress
 
       - name: Set up MSVC developer environment (Windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
+
+      # ------------------------------------------------------------
+      # VCPKG: static dependencies
+      # ------------------------------------------------------------
+      - name: Bootstrap vcpkg (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone https://github.com/microsoft/vcpkg "$RUNNER_TEMP/vcpkg"
+          # git -C "$RUNNER_TEMP/vcpkg" checkout <commit>   # pin for reproducible builds
+          "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$RUNNER_TEMP/vcpkg" >> "$GITHUB_ENV"
+          echo "VCPKG_DEFAULT_BINARY_CACHE=$RUNNER_TEMP/vcpkg-cache" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/vcpkg-cache"
+
+      - name: Bootstrap vcpkg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = "$env:RUNNER_TEMP\vcpkg"
+          git clone https://github.com/microsoft/vcpkg $root
+          & "$root\bootstrap-vcpkg.bat" -disableMetrics
+          $fwd = $root -replace '\\','/'
+          $cache = "$env:RUNNER_TEMP\vcpkg-cache" -replace '\\','/'
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          "VCPKG_ROOT=$fwd" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "VCPKG_DEFAULT_BINARY_CACHE=$cache" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/vcpkg-cache
+          key: vcpkg-${{ matrix.triplet }}-${{ hashFiles('.github/workflows/*.yml') }}
+          restore-keys: vcpkg-${{ matrix.triplet }}-
+
+      - name: Install dependencies (vcpkg)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Feature names can drift between vcpkg releases;
+          # `vcpkg x-package-info netcdf-c` lists the current ones.
+          "$VCPKG_ROOT/vcpkg" install --triplet ${{ matrix.triplet }} \
+            zlib sqlite3 tiff \
+            "proj[core,tiff]" \
+            geos \
+            "hdf5[core,zlib]" \
+            "netcdf-c[core,netcdf-4]"
 
       # ------------------------------------------------------------
       # CONFIGURE GDAL
@@ -121,49 +124,61 @@ jobs:
         run: |
           set -euo pipefail
 
-          GEN_ARGS=""
-          EXTRA_ARGS=""
+          EXTRA_ARGS=()
+          case "$RUNNER_OS" in
+            Linux)
+              # Hide statically linked symbols (HDF5 etc.) and avoid a libstdc++ dependency
+              LDF="-Wl,--exclude-libs,ALL -static-libstdc++ -static-libgcc"
+              EXTRA_ARGS+=("-DCMAKE_SHARED_LINKER_FLAGS=$LDF" "-DCMAKE_MODULE_LINKER_FLAGS=$LDF")
+              ;;
+            macOS)
+              EXTRA_ARGS+=(
+                "-DCMAKE_OSX_DEPLOYMENT_TARGET=12.0"
+                "-DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew;/usr/local"   # don't pick up Homebrew libs
+              )
+              ;;
+          esac
 
-          if [ "$RUNNER_OS" = "Windows" ] || [ "$RUNNER_OS" = "macOS" ]; then
-              GEN_ARGS="-G Ninja"
-          fi
-
-          if [ "$RUNNER_OS" = "Windows"]; then
-            EXTRA_ARGS="-DCMAKE_TOOLCHAIN_FILE=$USERPROFILE/vcpkg/scripts/buildsystems/vcpkg.cmake"
-          fi
-        
-          cmake -B build -S . $GEN_ARGS \
-            -DGDAL_USE_SWIG=ON \
-            -DGDAL_USE_JAVA=ON \
-            -DGDAL_USE_PYTHON=OFF \
-            -DGDAL_USE_CSHARP=OFF \
-            -DGDAL_USE_RUBY=OFF \
-            -DGDAL_USE_PHP=OFF \
-            -DGDAL_USE_PERL=OFF \
-            -DGDAL_ENABLE_DRIVER_OPENFILEGDB=ON \
-            -DGDAL_ENABLE_DRIVER_GTiff=ON \
-            -DGDAL_ENABLE_DRIVER_GPKG=ON \
-            -DGDAL_ENABLE_DRIVER_CSV=ON \
-            -DGDAL_ENABLE_DRIVER_NetCDF=ON \
-            -DGDAL_ENABLE_DRIVER_HDF5=ON \
-            -DGDAL_ENABLE_DRIVER_SHAPE=ON \
-            -DGDAL_ENABLE_DRIVER_MEM=ON \
+          cmake -B build -S . -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/install_root" \
-            $EXTRA_ARGS
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} \
+            -DVCPKG_MANIFEST_MODE=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_JAVA_BINDINGS=ON \
+            -DBUILD_PYTHON_BINDINGS=OFF \
+            -DBUILD_CSHARP_BINDINGS=OFF \
+            -DBUILD_APPS=OFF \
+            -DBUILD_TESTING=OFF \
+            \
+            -DGDAL_USE_EXTERNAL_LIBS=OFF \
+            -DGDAL_USE_ZLIB=ON \
+            -DGDAL_USE_SQLITE3=ON \
+            -DGDAL_USE_TIFF=ON \
+            -DGDAL_USE_GEOTIFF_INTERNAL=ON \
+            -DGDAL_USE_JSONC_INTERNAL=ON \
+            -DGDAL_USE_GEOS=ON \
+            -DGDAL_USE_HDF5=ON \
+            -DGDAL_USE_NETCDF=ON \
+            \
+            -DGDAL_BUILD_OPTIONAL_DRIVERS=OFF \
+            -DOGR_BUILD_OPTIONAL_DRIVERS=OFF \
+            -DGDAL_ENABLE_DRIVER_HDF5=ON \
+            -DGDAL_ENABLE_DRIVER_NETCDF=ON \
+            -DGDAL_ENABLE_DRIVER_AAIGRID=ON \
+            -DGDAL_ENABLE_DRIVER_XYZ=ON \
+            -DOGR_ENABLE_DRIVER_OPENFILEGDB=ON \
+            -DOGR_ENABLE_DRIVER_SHAPE=ON \
+            -DOGR_ENABLE_DRIVER_GPKG=ON \
+            -DOGR_ENABLE_DRIVER_CSV=ON \
+            "${EXTRA_ARGS[@]}"
 
-
-      # ------------------------------------------------------------
-      # BUILD
-      # ------------------------------------------------------------
-      - name: Build and install
+      - name: Build
         shell: bash
-        run: |
-          JOBS=$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 2)
-          cmake --build build --target install --config Release -j "$JOBS"
+        run: cmake --build build --config Release
 
       # ------------------------------------------------------------
-      # COLLECT JAVA ARTIFACTS
+      # COLLECT + VERIFY
       # ------------------------------------------------------------
       - name: Collect Java artifacts
         shell: bash
@@ -171,22 +186,33 @@ jobs:
           set -euo pipefail
           out="Java"
           mkdir -p "$out"
-
-          javadir=""
-          if [ -d "install_root/swig/java" ]; then
-            javadir="install_root/swig/java"
-          elif [ -d "build/swig/java" ]; then
-            javadir="build/swig/java"
-          else
-            echo "FAIL: no swig/java directory found." >&2
-            exit 1
-          fi
-
-          cp "$javadir"/gdal.jar "$out"/gdal.jar
-
-          find "$javadir" \
+          cp build/swig/java/gdal.jar "$out"/
+          find build/swig/java \
             \( -name 'gdalalljni.dll' -o -name 'libgdalalljni.so' -o -name 'libgdalalljni.dylib' \) \
             -type f -exec cp {} "$out"/ \;
+          cp "$VCPKG_ROOT/installed/${{ matrix.triplet }}/share/proj/proj.db" "$out"/
+          ls -la "$out"
+
+      - name: Verify native lib is self-contained
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS" in
+            Linux)
+              ldd Java/libgdalalljni.so
+              if ldd Java/libgdalalljni.so | grep '=>' \
+                 | grep -vE 'linux-vdso|ld-linux|libc\.so|libm\.so|libdl\.so|libpthread\.so|librt\.so'; then
+                echo "FAIL: unexpected shared dependencies" >&2; exit 1
+              fi ;;
+            macOS)
+              otool -L Java/libgdalalljni.dylib
+              if otool -L Java/libgdalalljni.dylib | tail -n +2 \
+                 | grep -vE '^\s*(/usr/lib/|/System/|@rpath/libgdalalljni)'; then
+                echo "FAIL: unexpected shared dependencies" >&2; exit 1
+              fi ;;
+            Windows)
+              dumpbin //dependents Java/gdalalljni.dll ;;
+          esac
 
       - name: Upload per-OS Java artifact
         uses: actions/upload-artifact@v7
@@ -215,33 +241,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p Java
+          mkdir -p Java/proj
 
-          # Copy gdal.jar (first valid one wins)
-          jar=""
-          for d in staging/GDAL-Java-*/; do
-            cand="${d}gdal.jar"
-            if [ -z "$jar" ] && [ -s "$cand" ]; then
-              cp "$cand" Java/gdal.jar
-              jar="Java/gdal.jar"
-            fi
-          done
+          first=$(ls -d staging/GDAL-Java-*/ | head -n1)
+          cp "${first}gdal.jar" Java/gdal.jar
+          cp "${first}proj.db"  Java/proj/proj.db     # platform independent
 
-          if [ -z "$jar" ]; then
-            echo "FAIL: no gdal.jar found." >&2
-            exit 1
-          fi
-
-          # Copy per-OS native libs
           for d in staging/GDAL-Java-*/; do
             sysname=$(basename "$d" | sed 's/^GDAL-Java-//')
-            outdir="Java/${sysname}"
-            mkdir -p "$outdir"
-
+            mkdir -p "Java/${sysname}"
             find "$d" \
               \( -name 'gdalalljni.dll' -o -name 'libgdalalljni.so' -o -name 'libgdalalljni.dylib' \) \
-              -type f -exec cp {} "$outdir"/ \;
+              -type f -exec cp {} "Java/${sysname}/" \;
           done
+          find Java -type f
 
       - name: Upload unified GDAL Java artifact
         uses: actions/upload-artifact@v7
