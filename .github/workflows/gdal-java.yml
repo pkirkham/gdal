@@ -128,9 +128,15 @@ jobs:
             GEN_ARGS="-G Ninja"
             EXTRA_ARGS="-DCMAKE_TOOLCHAIN_FILE=$USERPROFILE/vcpkg/scripts/buildsystems/vcpkg.cmake"
           fi
-
+        
           cmake -B build -S . $GEN_ARGS \
+            -DGDAL_USE_SWIG=ON \
             -DGDAL_USE_JAVA=ON \
+            -DGDAL_USE_PYTHON=OFF \
+            -DGDAL_USE_CSHARP=OFF \
+            -DGDAL_USE_RUBY=OFF \
+            -DGDAL_USE_PHP=OFF \
+            -DGDAL_USE_PERL=OFF \
             -DGDAL_ENABLE_DRIVER_OPENFILEGDB=ON \
             -DGDAL_ENABLE_DRIVER_GTiff=ON \
             -DGDAL_ENABLE_DRIVER_GPKG=ON \
@@ -142,6 +148,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/install_root" \
             $EXTRA_ARGS
+
 
       # ------------------------------------------------------------
       # BUILD
