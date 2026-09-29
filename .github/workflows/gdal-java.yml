@@ -124,8 +124,11 @@ jobs:
           GEN_ARGS=""
           EXTRA_ARGS=""
 
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            GEN_ARGS="-G Ninja"
+          if [ "$RUNNER_OS" = "Windows" ] || [ "$RUNNER_OS" = "macOS" ]; then
+              GEN_ARGS="-G Ninja"
+          fi
+
+          if [ "$RUNNER_OS" = "Windows"]; then
             EXTRA_ARGS="-DCMAKE_TOOLCHAIN_FILE=$USERPROFILE/vcpkg/scripts/buildsystems/vcpkg.cmake"
           fi
         
