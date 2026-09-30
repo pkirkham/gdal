@@ -32,7 +32,9 @@ jobs:
             sysname: Darwin
             triplet: arm64-osx
     runs-on: ${{ matrix.os }}
-
+    env:
+      VCPKG_COMMIT: 4cb050be2cfa7a947cdd2dd1a70e24b17774c979
+      
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -77,7 +79,8 @@ jobs:
         run: |
           set -euo pipefail
           git clone https://github.com/microsoft/vcpkg "$RUNNER_TEMP/vcpkg"
-          # git -C "$RUNNER_TEMP/vcpkg" checkout <commit>   # pin for reproducible builds
+          git -C "$RUNNER_TEMP/vcpkg" checkout "$VCPKG_COMMIT"
+          echo "vcpkg commit: $(git -C "$RUNNER_TEMP/vcpkg" rev-parse HEAD)"
           "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
           echo "VCPKG_ROOT=$RUNNER_TEMP/vcpkg" >> "$GITHUB_ENV"
           echo "VCPKG_DEFAULT_BINARY_CACHE=$RUNNER_TEMP/vcpkg-cache" >> "$GITHUB_ENV"
@@ -89,6 +92,8 @@ jobs:
         run: |
           $root = "$env:RUNNER_TEMP\vcpkg"
           git clone https://github.com/microsoft/vcpkg $root
+          git -C $root checkout $env:VCPKG_COMMIT
+          Write-Host "vcpkg commit: $(git -C $root rev-parse HEAD)"
           & "$root\bootstrap-vcpkg.bat" -disableMetrics
           $fwd = $root -replace '\\','/'
           $cache = "$env:RUNNER_TEMP\vcpkg-cache" -replace '\\','/'
@@ -100,7 +105,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/vcpkg-cache
-          key: vcpkg-${{ matrix.triplet }}-${{ hashFiles('.github/workflows/*.yml') }}
+          key: vcpkg-${{ matrix.triplet }}-${{ env.VCPKG_COMMIT }}
           restore-keys: vcpkg-${{ matrix.triplet }}-
 
       - name: Install dependencies (vcpkg)
@@ -260,7 +265,8 @@ jobs:
         with:
           name: GDAL-Java-${{ matrix.sysname }}
           path: Java
-
+          retention-days: 1
+          
   # ------------------------------------------------------------
   # MERGE JOB
   # ------------------------------------------------------------
@@ -303,8 +309,3 @@ jobs:
         with:
           name: GDAL-Java
           path: Java
-
-      - name: Delete intermediate per-OS artifacts
-        uses: geekyeggo/delete-artifact@v6
-        with:
-          name: GDAL-Java-*
