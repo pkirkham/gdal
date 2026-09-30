@@ -110,7 +110,7 @@ jobs:
           # Feature names can drift between vcpkg releases;
           # `vcpkg x-package-info netcdf-c` lists the current ones.
           "$VCPKG_ROOT/vcpkg" install --triplet ${{ matrix.triplet }} \
-            zlib sqlite3 tiff \
+            zlib "sqlite3[core,rtree]" tiff \
             "proj[core,tiff]" \
             geos \
             "hdf5[core,zlib]" \
