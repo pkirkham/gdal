@@ -127,14 +127,19 @@ jobs:
           EXTRA_ARGS=()
           case "$RUNNER_OS" in
             Linux)
-              # Hide statically linked symbols (HDF5 etc.) and avoid a libstdc++ dependency
               LDF="-Wl,--exclude-libs,ALL -static-libstdc++ -static-libgcc"
-              EXTRA_ARGS+=("-DCMAKE_SHARED_LINKER_FLAGS=$LDF" "-DCMAKE_MODULE_LINKER_FLAGS=$LDF")
+              EXTRA_ARGS+=(
+                "-DCMAKE_SHARED_LINKER_FLAGS=$LDF" "-DCMAKE_MODULE_LINKER_FLAGS=$LDF"
+                "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON" '-DCMAKE_INSTALL_RPATH=$ORIGIN'
+              )
               ;;
             macOS)
               EXTRA_ARGS+=(
                 "-DCMAKE_OSX_DEPLOYMENT_TARGET=12.0"
-                "-DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew;/usr/local"   # don't pick up Homebrew libs
+                "-DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew;/usr/local"
+                "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON" "-DCMAKE_INSTALL_RPATH=@loader_path"
+                "-DSWIG_EXECUTABLE=$(command -v swig)"
+                "-DANT=$(command -v ant)"
               )
               ;;
           esac
@@ -144,7 +149,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} \
             -DVCPKG_MANIFEST_MODE=OFF \
-            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_SHARED_LIBS=ON \
             -DBUILD_JAVA_BINDINGS=ON \
             -DBUILD_PYTHON_BINDINGS=OFF \
             -DBUILD_CSHARP_BINDINGS=OFF \
@@ -172,7 +177,11 @@ jobs:
             -DOGR_ENABLE_DRIVER_GPKG=ON \
             -DOGR_ENABLE_DRIVER_CSV=ON \
             "${EXTRA_ARGS[@]}"
-
+            
+      - name: Show binding configuration
+        shell: bash
+        run: grep -iE 'BUILD_JAVA|BUILD_SHARED|SWIG_EXECUTABLE|JNI_|JAVA_|^ANT' build/CMakeCache.txt || true
+        
       - name: Build
         shell: bash
         run: cmake --build build --config Release
@@ -186,32 +195,64 @@ jobs:
           set -euo pipefail
           out="Java"
           mkdir -p "$out"
-          cp build/swig/java/gdal.jar "$out"/
+
+          # 1. The jar (versioned name -> fixed name)
+          jar=$(find build/swig/java -maxdepth 3 -name 'gdal*.jar' \
+                  ! -name '*-sources.jar' ! -name '*-javadoc.jar' | head -n1)
+          if [ -z "$jar" ]; then
+            echo "FAIL: no GDAL jar found. All jars in build tree:" >&2
+            find build -name '*.jar' >&2 || true
+            exit 1
+          fi
+          echo "Using $jar"
+          cp "$jar" "$out/gdal.jar"
+
+          # 2. The JNI library
           find build/swig/java \
             \( -name 'gdalalljni.dll' -o -name 'libgdalalljni.so' -o -name 'libgdalalljni.dylib' \) \
             -type f -exec cp {} "$out"/ \;
+
+          # 3. The shared libgdal it links against
+          case "$RUNNER_OS" in
+            Linux)
+              soname=$(readelf -d build/libgdal.so | sed -n 's/.*SONAME.*\[\(.*\)\]/\1/p')
+              cp -L build/libgdal.so "$out/$soname" ;;
+            macOS)
+              name=$(basename "$(otool -D build/libgdal.dylib | tail -n1)")
+              cp -L build/libgdal.dylib "$out/$name" ;;
+            Windows)
+              find build -maxdepth 2 -name 'gdal*.dll' -type f -exec cp {} "$out"/ \; ;;
+          esac
+
+          # 4. PROJ database
           cp "$VCPKG_ROOT/installed/${{ matrix.triplet }}/share/proj/proj.db" "$out"/
           ls -la "$out"
 
-      - name: Verify native lib is self-contained
+      - name: Verify native libs are self-contained
         shell: bash
         run: |
           set -euo pipefail
           case "$RUNNER_OS" in
             Linux)
-              ldd Java/libgdalalljni.so
-              if ldd Java/libgdalalljni.so | grep '=>' \
-                 | grep -vE 'linux-vdso|ld-linux|libc\.so|libm\.so|libdl\.so|libpthread\.so|librt\.so'; then
-                echo "FAIL: unexpected shared dependencies" >&2; exit 1
-              fi ;;
+              for lib in Java/libgdalalljni.so Java/libgdal.so.*; do
+                echo "== $lib"; ldd "$lib"
+                if ldd "$lib" | grep '=>' \
+                   | grep -vE 'linux-vdso|ld-linux|libc\.so|libm\.so|libdl\.so|libpthread\.so|librt\.so|libgdal\.so'; then
+                  echo "FAIL: unexpected shared dependencies in $lib" >&2; exit 1
+                fi
+              done ;;
             macOS)
-              otool -L Java/libgdalalljni.dylib
-              if otool -L Java/libgdalalljni.dylib | tail -n +2 \
-                 | grep -vE '^\s*(/usr/lib/|/System/|@rpath/libgdalalljni)'; then
-                echo "FAIL: unexpected shared dependencies" >&2; exit 1
-              fi ;;
+              for lib in Java/libgdalalljni.dylib Java/libgdal*.dylib; do
+                echo "== $lib"; otool -L "$lib"
+                if otool -L "$lib" | tail -n +2 \
+                   | grep -vE '^\s*(/usr/lib/|/System/|@rpath/libgdal)'; then
+                  echo "FAIL: unexpected shared dependencies in $lib" >&2; exit 1
+                fi
+              done ;;
             Windows)
-              dumpbin //dependents Java/gdalalljni.dll ;;
+              for lib in Java/*.dll; do
+                echo "== $lib"; dumpbin //dependents "$lib"
+              done ;;
           esac
 
       - name: Upload per-OS Java artifact
@@ -251,8 +292,9 @@ jobs:
             sysname=$(basename "$d" | sed 's/^GDAL-Java-//')
             mkdir -p "Java/${sysname}"
             find "$d" \
-              \( -name 'gdalalljni.dll' -o -name 'libgdalalljni.so' -o -name 'libgdalalljni.dylib' \) \
-              -type f -exec cp {} "Java/${sysname}/" \;
+              \( -name 'gdalalljni.dll' -o -name 'libgdalalljni.so' -o -name 'libgdalalljni.dylib' \
+                 -o -name 'libgdal.so.*' -o -name 'libgdal*.dylib' -o -name 'gdal*.dll' \) \
+                 -type f -exec cp {} "Java/${sysname}"/ \;
           done
           find Java -type f
 
